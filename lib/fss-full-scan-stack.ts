@@ -121,10 +121,10 @@ def get_matching_s3_objects(bucket, prefix="", suffix=""):
     except KeyError:
       break
     
-  for obj in contents:
-    key = obj["Key"]
-    if key.endswith(suffix):
-      yield obj
+    for obj in contents:
+      key = obj["Key"]
+      if key.endswith(suffix):
+        yield obj
   
   
   
