@@ -1,3 +1,4 @@
+
 # Copyright (C) 2021 Trend Micro Inc. All rights reserved.
 
 import json
@@ -104,9 +105,7 @@ def handle_step_functions_event(bucket, key):
     print(sqs_response)
 
 def lambda_handler(event, context):
-    print('event:' + json.dumps(event))
-    print('boto3 version:' + boto3.__version__)
-    print('botocore version:' + botocore.__version__)
+
     bucket = os.environ['BucketToScanName']
-    key = event['Key']
+    key = event
     handle_step_functions_event(bucket, key)

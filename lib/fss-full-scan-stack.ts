@@ -47,34 +47,86 @@ export class FssFullScanStack extends Stack {
     const sqsUrl = sqsUrlInput.valueAsString;
     const topicArn = topicArnInput.valueAsString;
 
-    const executionRole = new iam.Role(this, 'ExecutionRole', {
+
+    // Paginator
+    const paginatorExecutionRole = new iam.Role(this, 'PaginatorExecutionRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
     });
 
-    executionRole.addToPolicy(new iam.PolicyStatement({
+    paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [`${bucket.bucketArn}`],
+      actions: ['s3:ListBucket'],
+    }));
+
+    const paginatorFunction = new lambda.Function(this, 'PaginatorFunction', {
+      runtime: lambda.Runtime.PYTHON_3_9,
+      handler: 'index.lambda_handler',
+      role: paginatorExecutionRole,
+      timeout: Duration.minutes(10),
+      memorySize: 128,
+      environment: {
+        'BucketToScanName': bucket.bucketName,
+      },
+      code: lambda.InlineCode.fromInline(`
+import boto3
+import json
+
+def get_matching_s3_objects(bucket):
+  s3 = boto3.client("s3")
+  paginator = s3.get_paginator("list_objects_v2")
+    
+  kwargs = {'Bucket': bucket}
+  
+  bucket_object_list = []
+  for page in paginator.paginate(**kwargs):
+    if "Contents" in page:
+      for key in page[ "Contents" ]:
+        keyString = json.dumps(key[ "Key" ])
+        bucket_object_list.append(keyString)
+  return bucket_object_list
+
+def lambda_handler(event, context):  
+  keys = get_matching_s3_objects('s3-assessment-test')
+  result = {
+      'Keys': keys
+  }
+  return result
+      `)
+    });
+
+    // Scan Starter
+    const scanStarterExecutionRole = new iam.Role(this, 'ScanStarterExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
+    });
+
+    scanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       resources: [`${bucket.bucketArn}/*`],
       actions: ['s3:GetObject', 's3:PutObjectTagging'],
     }));
 
-    executionRole.addToPolicy(new iam.PolicyStatement({
+    scanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       resources: [queueArn],
       actions: ['sqs:SendMessage'],
     }));
 
-    const scanStarterFunction = new lambda.Function(this, 'ScanStarter', {
-      runtime: lambda.Runtime.PYTHON_3_8,
-      handler: 'index.handler',
-      role: executionRole,
-      timeout: Duration.minutes(10),
+    const scanStarterFunction = new lambda.Function(this, 'ScanStarterFunction', {
+      runtime: lambda.Runtime.PYTHON_3_9,
+      handler: 'index.lambda_handler',
+      role: scanStarterExecutionRole,
+      timeout: Duration.minutes(1),
+      memorySize: 128,
       environment: {
         'SNSArn': topicArn,
         'SQSUrl': sqsUrl,
         'BucketToScanName': bucket.bucketName,
       },
       code: lambda.InlineCode.fromInline(`
+
 # Copyright (C) 2021 Trend Micro Inc. All rights reserved.
 
 import json
@@ -181,45 +233,35 @@ def handle_step_functions_event(bucket, key):
     print(sqs_response)
 
 def lambda_handler(event, context):
-    print('event:' + json.dumps(event))
-    print('boto3 version:' + boto3.__version__)
-    print('botocore version:' + botocore.__version__)
+
     bucket = os.environ['BucketToScanName']
-    key = event['Key']
+    key = event
     handle_step_functions_event(bucket, key)
       `)
     });
 
-    const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
-      schedule: events.Schedule.expression(schedule.valueAsString),
-      targets: [new targets.LambdaFunction(scanStarterFunction)],
-    });
-    const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
-    cfnScanOnSchedule.cfnOptions.condition = setSchedule;
-    const cfnFullScanner = scanStarterFunction.permissionsNode.defaultChild as lambda.CfnPermission;
-    cfnFullScanner.cfnOptions.condition = setSchedule;
-
-    const definition = new tasks.CallAwsService(this, 'ListObjectsV2', {
-      action: 'ListObjectsV2',
-      service: 'S3',
-      iamResources: [bucket.bucketArn],
-      iamAction: 's3:ListBucket',
-      parameters: {
-        'Bucket': bucket.bucketName
-      },
-
+    const definition = new tasks.LambdaInvoke(this, 'Paginator', {
+      lambdaFunction: paginatorFunction,
+      outputPath: '$.Payload',
     }).next(new stepfunctions.Map(this, 'Map', {
       maxConcurrency: 40,
-      itemsPath: '$.Contents',
-
-    }).iterator(new tasks.LambdaInvoke(this, 'CallLambdaFunction', {
+      inputPath: "$.Keys"
+    }).iterator(new tasks.LambdaInvoke(this, 'ScanStarter', {
       lambdaFunction: scanStarterFunction,
       outputPath: "$.Payload",
     })))
-
     const fullScanStateMachine  = new stepfunctions.StateMachine(this, 'SimpleStateMachine', {
       definition: definition
     });
+
+    const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
+      schedule: events.Schedule.expression(schedule.valueAsString),
+      targets: [new targets.SfnStateMachine(fullScanStateMachine)],
+    });
+    const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
+    cfnScanOnSchedule.cfnOptions.condition = setSchedule;
+    // const cfnFullScanner = scanStarterFunction.permissionsNode.defaultChild as lambda.CfnPermission;
+    // cfnFullScanner.cfnOptions.condition = setSchedule;
 
     new CfnOutput(this, 'FullScanStepFunctionsPage', {
       value: `https://${this.region}.console.aws.amazon.com/states/home?region=${this.region}#/statemachines/view/${fullScanStateMachine.stateMachineArn}`
