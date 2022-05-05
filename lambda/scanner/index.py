@@ -107,5 +107,5 @@ def handle_step_functions_event(bucket, key):
 def lambda_handler(event, context):
 
     bucket = os.environ['BucketToScanName']
-    key = event
+    key = event['Key']
     handle_step_functions_event(bucket, key)

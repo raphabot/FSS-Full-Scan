@@ -47,55 +47,6 @@ export class FssFullScanStack extends Stack {
     const sqsUrl = sqsUrlInput.valueAsString;
     const topicArn = topicArnInput.valueAsString;
 
-
-    // Paginator
-    const paginatorExecutionRole = new iam.Role(this, 'PaginatorExecutionRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
-    });
-
-    paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      resources: [`${bucket.bucketArn}`],
-      actions: ['s3:ListBucket'],
-    }));
-
-    const paginatorFunction = new lambda.Function(this, 'PaginatorFunction', {
-      runtime: lambda.Runtime.PYTHON_3_9,
-      handler: 'index.lambda_handler',
-      role: paginatorExecutionRole,
-      timeout: Duration.minutes(10),
-      memorySize: 128,
-      environment: {
-        'BucketToScanName': bucket.bucketName,
-      },
-      code: lambda.InlineCode.fromInline(`
-import boto3
-import json
-
-def get_matching_s3_objects(bucket):
-  s3 = boto3.client("s3")
-  paginator = s3.get_paginator("list_objects_v2")
-    
-  kwargs = {'Bucket': bucket}
-  
-  bucket_object_list = []
-  for page in paginator.paginate(**kwargs):
-    if "Contents" in page:
-      for key in page[ "Contents" ]:
-        keyString = json.dumps(key[ "Key" ])
-        bucket_object_list.append(keyString)
-  return bucket_object_list
-
-def lambda_handler(event, context):  
-  keys = get_matching_s3_objects('s3-assessment-test')
-  result = {
-      'Keys': keys
-  }
-  return result
-      `)
-    });
-
     // Scan Starter
     const scanStarterExecutionRole = new iam.Role(this, 'ScanStarterExecutionRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -125,146 +76,52 @@ def lambda_handler(event, context):
         'SQSUrl': sqsUrl,
         'BucketToScanName': bucket.bucketName,
       },
-      code: lambda.InlineCode.fromInline(`
-
-# Copyright (C) 2021 Trend Micro Inc. All rights reserved.
-
-import json
-import os
-import logging
-import boto3
-import botocore
-from botocore.config import Config
-from botocore.exceptions import ClientError
-import urllib.parse
-import uuid
-import datetime
-
-sqs_url = os.environ['SQSUrl']
-print('scanner queue URL: ' + sqs_url)
-sqs_region = sqs_url.split('.')[1]
-print('scanner queue region: ' + sqs_region)
-sqs_endpoint_url = 'https://sqs.{0}.amazonaws.com'.format(sqs_region)
-print('scanner queue endpoint URL: ' + sqs_endpoint_url)
-report_object_key = 'True' == os.environ.get('REPORT_OBJECT_KEY', 'False')
-print(f'report object key: {report_object_key}')
-
-region = boto3.session.Session().region_name
-s3_client_path = boto3.client('s3', region, config=Config(s3={'addressing_style': 'path'}, signature_version='s3v4'))
-s3_client_virtual = boto3.client('s3', region, config=Config(s3={'addressing_style': 'virtual'}, signature_version='s3v4'))
-
-try:
-    with open('version.json') as version_file:
-        version = json.load(version_file)
-        print(f'version: {version}')
-except Exception as ex:
-    print('failed to get version: ' + str(ex))
-
-def create_presigned_url(bucket_name, object_name, expiration):
-    """Generate a presigned URL to share an S3 object
-
-    :param bucket_name: string
-    :param object_name: string
-    :param expiration: Time in seconds for the presigned URL to remain valid
-    :return: Presigned URL as string. If error, returns None.
-    """
-
-    # Generate a presigned URL for the S3 object
-    try:
-        s3_client = s3_client_path if '.' in bucket_name else s3_client_virtual
-        response = s3_client.generate_presigned_url(
-            'get_object',
-            Params={
-                'Bucket': bucket_name,
-                'Key': object_name
-            },
-            ExpiresIn=expiration
-        )
-    except ClientError as e:
-        print('failed to generate pre-signed URL: ' + str(e))
-        return None
-
-    # The response contains the presigned URL which is sensitive data
-    return response
-
-
-def push_to_sqs(bucket_name, object_name, amz_request_id, presigned_url, event_time):
-    object = {
-        'S3': {
-            'bucket': bucket_name,
-            'object': object_name,
-            'amzRequestID': amz_request_id,
-        },
-        'ScanID': str(uuid.uuid4()),
-        'SNS' : os.environ['SNSArn'],
-        'URL': presigned_url,
-        'ModTime': event_time,
-        'ReportObjectKey': report_object_key
-    }
-    try:
-        session = boto3.session.Session(region_name=sqs_region)
-        sqs = session.resource(service_name='sqs', endpoint_url=sqs_endpoint_url)
-        queue = sqs.Queue(url=sqs_url)
-        response = queue.send_message(MessageBody=json.dumps(object))
-        return response
-    except ClientError as e:
-        print('failed to push SQS message: ' + str(e))
-        return None
-
-def is_folder(key):
-    return key.endswith('/')
-
-def handle_step_functions_event(bucket, key):
-    key = urllib.parse.unquote_plus(key)
-    amz_request_id = "f"
-    event_time = datetime.datetime.utcnow().isoformat() # ISO-8601 format, 1970-01-01T00:00:00.000Z, when Amazon S3 finished processing the request
-
-    if is_folder(key):
-        print('Skip scanning for folder.')
-        return
-
-    presigned_url = create_presigned_url(
-        bucket,
-        key,
-        expiration = 60 * 60 # in seconds
-    )
-    print(f'AMZ request ID: {amz_request_id}, event time: {event_time}, URL:', presigned_url.split('?')[0])
-    sqs_response = push_to_sqs(bucket, key, amz_request_id, presigned_url, event_time)
-    print(sqs_response)
-
-def lambda_handler(event, context):
-
-    bucket = os.environ['BucketToScanName']
-    key = event
-    handle_step_functions_event(bucket, key)
-      `)
+      code: lambda.Code.fromAsset('./lambda/scanner')
     });
 
-    const definition = new tasks.LambdaInvoke(this, 'Paginator', {
-      lambdaFunction: paginatorFunction,
-      outputPath: '$.Payload',
-    }).next(new stepfunctions.Map(this, 'Map', {
-      maxConcurrency: 40,
-      inputPath: "$.Keys"
-    }).iterator(new tasks.LambdaInvoke(this, 'ScanStarter', {
-      lambdaFunction: scanStarterFunction,
-      outputPath: "$.Payload",
-    })))
-    const fullScanStateMachine  = new stepfunctions.StateMachine(this, 'SimpleStateMachine', {
-      definition: definition
+    // Paginator
+    const paginatorExecutionRole = new iam.Role(this, 'PaginatorExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
     });
 
-    const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
-      schedule: events.Schedule.expression(schedule.valueAsString),
-      targets: [new targets.SfnStateMachine(fullScanStateMachine)],
+    paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [`${bucket.bucketArn}`],
+      actions: ['s3:ListBucket'],
+    }));
+
+    paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [`${scanStarterFunction.functionArn}`],
+      actions: ['lambda:InvokeFunction'],
+    }));
+
+    const paginatorFunction = new lambda.Function(this, 'PaginatorFunction', {
+      runtime: lambda.Runtime.NODEJS_14_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'index.lambda_handler',
+      role: paginatorExecutionRole,
+      timeout: Duration.minutes(15),
+      memorySize: 256,
+      environment: {
+        'BUCKET_NAME': bucket.bucketName,
+        'SCAN_FUNCTION_NAME': scanStarterFunction.functionArn,
+      },
+      code: lambda.Code.fromAsset('./lambda/paginator')
     });
-    const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
-    cfnScanOnSchedule.cfnOptions.condition = setSchedule;
-    // const cfnFullScanner = scanStarterFunction.permissionsNode.defaultChild as lambda.CfnPermission;
+
+    // const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
+    //   schedule: events.Schedule.expression(schedule.valueAsString),
+    //   targets: [new targets.LambdaFunction(paginatorFunction)],
+    // });
+    // const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
+    // cfnScanOnSchedule.cfnOptions.condition = setSchedule;
+    // const cfnFullScanner = paginatorFunction.permissionsNode.defaultChild as lambda.CfnPermission;
     // cfnFullScanner.cfnOptions.condition = setSchedule;
 
-    new CfnOutput(this, 'FullScanStepFunctionsPage', {
-      value: `https://${this.region}.console.aws.amazon.com/states/home?region=${this.region}#/statemachines/view/${fullScanStateMachine.stateMachineArn}`
+    new CfnOutput(this, 'FullScanFunctionPage', {
+      value: `https://${this.region}.console.aws.amazon.com/lambda/home?region=${this.region}#/functions/${paginatorFunction.functionName}?tab=code`
     });
 
   };
