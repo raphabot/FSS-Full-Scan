@@ -47,39 +47,7 @@ export class FssFullScanStack extends Stack {
     const sqsUrl = sqsUrlInput.valueAsString;
     const topicArn = topicArnInput.valueAsString;
 
-    // Scan Starter
-    const scanStarterExecutionRole = new iam.Role(this, 'ScanStarterExecutionRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
-    });
-
-    scanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      resources: [`${bucket.bucketArn}/*`],
-      actions: ['s3:GetObject', 's3:PutObjectTagging'],
-    }));
-
-    scanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      resources: [queueArn],
-      actions: ['sqs:SendMessage'],
-    }));
-
-    const scanStarterFunction = new lambda.Function(this, 'ScanStarterFunction', {
-      runtime: lambda.Runtime.PYTHON_3_9,
-      handler: 'index.lambda_handler',
-      role: scanStarterExecutionRole,
-      timeout: Duration.minutes(1),
-      memorySize: 128,
-      environment: {
-        'SNSArn': topicArn,
-        'SQSUrl': sqsUrl,
-        'BucketToScanName': bucket.bucketName,
-      },
-      code: lambda.Code.fromAsset('./lambda/scanner')
-    });
-
-    // Paginator
+    // Paginator Function
     const paginatorExecutionRole = new iam.Role(this, 'PaginatorExecutionRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
@@ -87,14 +55,8 @@ export class FssFullScanStack extends Stack {
 
     paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      resources: [`${bucket.bucketArn}`],
+      resources: [bucket.bucketArn],
       actions: ['s3:ListBucket'],
-    }));
-
-    paginatorExecutionRole.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      resources: [`${scanStarterFunction.functionArn}`],
-      actions: ['lambda:InvokeFunction'],
     }));
 
     const paginatorFunction = new lambda.Function(this, 'PaginatorFunction', {
@@ -106,9 +68,263 @@ export class FssFullScanStack extends Stack {
       memorySize: 256,
       environment: {
         'BUCKET_NAME': bucket.bucketName,
-        'SCAN_FUNCTION_NAME': scanStarterFunction.functionArn,
       },
       code: lambda.Code.fromAsset('./lambda/paginator')
+    });
+
+    // Filter Function
+    const filterExecutionRole = new iam.Role(this, 'FilterExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
+    });
+
+    const filterFunction = new lambda.Function(this, 'FilterFunction', {
+      runtime: lambda.Runtime.NODEJS_14_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'index.lambda_handler',
+      role: filterExecutionRole,
+      timeout: Duration.minutes(15),
+      memorySize: 256,
+      environment: {
+        'BUCKET_NAME': bucket.bucketName,
+      },
+      code: lambda.Code.fromAsset('./lambda/filter')
+    });
+
+    // Scanner Function
+    const scanOneObjectExecutionRole = new iam.Role(this, 'ScanOneObjectExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')]
+    });
+
+    scanOneObjectExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [`${bucket.bucketArn}/*`],
+      actions: ['s3:GetObject', 's3:PutObjectTagging'],
+    }));
+
+    scanOneObjectExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [queueArn],
+      actions: ['sqs:SendMessage'],
+    }));
+
+    const scanOneObjectFunction = new lambda.Function(this, 'ScanOneObjectFunction', {
+      runtime: lambda.Runtime.PYTHON_3_9,
+      handler: 'index.lambda_handler',
+      role: scanOneObjectExecutionRole,
+      timeout: Duration.minutes(1),
+      memorySize: 128,
+      environment: {
+        'SNSArn': topicArn,
+        'SQSUrl': sqsUrl,
+      },
+      code: lambda.Code.fromAsset('./lambda/scanner')
+    });
+
+    // ScannerLoop Step Function
+    const scannerLoopExecutionRole = new iam.Role(this, 'ScanStarterExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('states.amazonaws.com')
+    });
+
+    scannerLoopExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [scanOneObjectFunction.functionArn,filterFunction.functionArn],
+      actions: ['lambda:InvokeFunction'],
+    }));
+    
+    const scannerLoopStateMachineName = 'ScannerLoopStateMachine';
+    const scannerLoopStepFunction = new stepfunctions.CfnStateMachine(this, "ScannerLoopStepFunction", {
+      roleArn: scannerLoopExecutionRole.roleArn,
+      stateMachineName: scannerLoopStateMachineName,
+      definitionString: `
+      {
+        "Comment": "A machine that loops trough all files a bucket to scan them with File Storage Security.",
+        "StartAt": "Filter first 1000 keys to scan",
+        "States": {
+          "Filter first 1000 keys to scan": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "Payload.$": "$",
+              "FunctionName": "${filterFunction.functionArn}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Parallel"
+          },
+          "Parallel": {
+            "Type": "Parallel",
+            "Branches": [
+              {
+                "StartAt": "Map",
+                "States": {
+                  "Map": {
+                    "Type": "Map",
+                    "End": true,
+                    "Parameters": {
+                      "key.$": "$$.Map.Item.Value",
+                      "bucket.$": "$.bucket"
+                    },
+                    "Iterator": {
+                      "StartAt": "Scan a Object",
+                      "States": {
+                        "Scan a Object": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::lambda:invoke",
+                          "OutputPath": "$.Payload",
+                          "Parameters": {
+                            "Payload.$": "$",
+                            "FunctionName": "${scanOneObjectFunction.functionArn}"
+                          },
+                          "Retry": [
+                            {
+                              "ErrorEquals": [
+                                "Lambda.ServiceException",
+                                "Lambda.AWSLambdaException",
+                                "Lambda.SdkClientException"
+                              ],
+                              "IntervalSeconds": 2,
+                              "MaxAttempts": 6,
+                              "BackoffRate": 2
+                            }
+                          ],
+                          "End": true
+                        }
+                      }
+                    },
+                    "ItemsPath": "$.keys"
+                  }
+                }
+              },
+              {
+                "StartAt": "Are there keys left?",
+                "States": {
+                  "Are there keys left?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.remainingKeysLength",
+                        "NumericGreaterThan": 0,
+                        "Comment": "Yes",
+                        "Next": "Re-execute with the remaining keys."
+                      }
+                    ],
+                    "Default": "Pass"
+                  },
+                  "Re-execute with the remaining keys.": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::states:startExecution",
+                    "Parameters": {
+                      "StateMachineArn": "arn:${Stack.of(this).partition}:states:${Stack.of(this).region}:${Stack.of(this).account}:stateMachine:${scannerLoopStateMachineName}",
+                      "Input": {
+                        "keys.$": "$.remainingKeys",
+                        "bucket.$": "$.bucket",
+                        "limit.$": "$.limit",
+                        "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+                      }
+                    },
+                    "End": true
+                  },
+                  "Pass": {
+                    "Type": "Pass",
+                    "End": true,
+                    "Result": {}
+                  }
+                }
+              }
+            ],
+            "End": true
+          }
+        }
+      }
+      `,
+    });
+
+    scannerLoopExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [scannerLoopStepFunction.attrArn],
+      actions: ['states:StartExecution'],
+    }));
+
+    // Full Scan Starter Step Function
+    const fullScanStarterExecutionRole = new iam.Role(this, 'FullScanStarterExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('states.amazonaws.com')
+    });
+
+    fullScanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [paginatorFunction.functionArn],
+      actions: ['lambda:InvokeFunction'],
+    }));
+
+    fullScanStarterExecutionRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      resources: [scannerLoopStepFunction.attrArn],
+      actions: ['states:StartExecution'],
+    }));
+
+    const fullScanStarterStateMachineName = 'fullScanStarterStateMachine';
+    const fullScanStarterLoopStepFunction = new stepfunctions.CfnStateMachine(this, "FullScanStarterLoopStepFunction", {
+      roleArn: fullScanStarterExecutionRole.roleArn,
+      stateMachineName: fullScanStarterStateMachineName,
+      definitionString: `
+      {
+        "Comment": "Kicks of a Full Scan using File Storage Security.",
+        "StartAt": "List all keys in bucket",
+        "States": {
+          "List all keys in bucket": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "FunctionName": "${paginatorFunction.functionArn}",
+              "Payload": {
+                "bucket": "${bucket.bucketName}"
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Start Scanner Flow"
+          },
+          "Start Scanner Flow": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution",
+            "Parameters": {
+              "StateMachineArn": "${scannerLoopStepFunction.attrArn}",
+              "Input": {
+                "keys.$": "$.keys",
+                "bucket.$": "$.bucket",
+                "limit": 500,
+                "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+              }
+            },
+            "End": true
+          }
+        }
+      }
+      `
     });
 
     // const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
@@ -121,7 +337,7 @@ export class FssFullScanStack extends Stack {
     // cfnFullScanner.cfnOptions.condition = setSchedule;
 
     new CfnOutput(this, 'FullScanFunctionPage', {
-      value: `https://${this.region}.console.aws.amazon.com/lambda/home?region=${this.region}#/functions/${paginatorFunction.functionName}?tab=code`
+      value: `https://${this.region}.console.aws.amazon.com/states/home?region=${this.region}#/statemachines/view/arn:${this.partition}:states:${Stack.of(this).region}:${Stack.of(this).account}:stateMachine:${fullScanStarterStateMachineName}`,
     });
 
   };

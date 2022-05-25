@@ -1,4 +1,3 @@
-
 # Copyright (C) 2021 Trend Micro Inc. All rights reserved.
 
 import json
@@ -106,6 +105,6 @@ def handle_step_functions_event(bucket, key):
 
 def lambda_handler(event, context):
 
-    bucket = os.environ['BucketToScanName']
-    key = event['Key']
+    bucket = event['bucket']
+    key = event['key']
     handle_step_functions_event(bucket, key)
