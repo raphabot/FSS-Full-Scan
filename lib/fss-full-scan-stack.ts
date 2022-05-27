@@ -68,7 +68,7 @@ export class FssFullScanStack extends Stack {
       handler: 'index.lambda_handler',
       role: paginatorExecutionRole,
       timeout: Duration.minutes(15),
-      memorySize: 256,
+      memorySize: 1024,
       environment: {
         'STATE_BUCKET': stateBucket.bucketName,
       },
@@ -88,7 +88,7 @@ export class FssFullScanStack extends Stack {
       handler: 'index.lambda_handler',
       role: filterExecutionRole,
       timeout: Duration.minutes(15),
-      memorySize: 256,
+      memorySize: 512,
       environment: {
         'BUCKET_NAME': bucket.bucketName,
       },
