@@ -47,6 +47,9 @@ export class FssFullScanStack extends Stack {
     const sqsUrl = sqsUrlInput.valueAsString;
     const topicArn = topicArnInput.valueAsString;
 
+    // State Bucket
+    const stateBucket = new s3.Bucket(this, 'StateBucket', {})
+
     // Paginator Function
     const paginatorExecutionRole = new iam.Role(this, 'PaginatorExecutionRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -67,10 +70,11 @@ export class FssFullScanStack extends Stack {
       timeout: Duration.minutes(15),
       memorySize: 256,
       environment: {
-        'BUCKET_NAME': bucket.bucketName,
+        'STATE_BUCKET': stateBucket.bucketName,
       },
       code: lambda.Code.fromAsset('./lambda/paginator')
     });
+    stateBucket.grantWrite(paginatorFunction);
 
     // Filter Function
     const filterExecutionRole = new iam.Role(this, 'FilterExecutionRole', {
@@ -90,6 +94,7 @@ export class FssFullScanStack extends Stack {
       },
       code: lambda.Code.fromAsset('./lambda/filter')
     });
+    stateBucket.grantReadWrite(filterFunction);
 
     // Scanner Function
     const scanOneObjectExecutionRole = new iam.Role(this, 'ScanOneObjectExecutionRole', {
@@ -229,9 +234,10 @@ export class FssFullScanStack extends Stack {
                     "Parameters": {
                       "StateMachineArn": "arn:${Stack.of(this).partition}:states:${Stack.of(this).region}:${Stack.of(this).account}:stateMachine:${scannerLoopStateMachineName}",
                       "Input": {
-                        "keys.$": "$.remainingKeys",
-                        "bucket.$": "$.bucket",
+                        "stateBucket.$": "$.stateBucket",
+                        "stateKey.$": "$.stateKey",
                         "limit.$": "$.limit",
+                        "bucket.$": "$.bucket",
                         "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
                       }
                     },
@@ -314,9 +320,10 @@ export class FssFullScanStack extends Stack {
             "Parameters": {
               "StateMachineArn": "${scannerLoopStepFunction.attrArn}",
               "Input": {
-                "keys.$": "$.keys",
+                "stateKey.$": "$.stateKey",
                 "bucket.$": "$.bucket",
-                "limit": 500,
+                "stateBucket.$": "$.stateBucket",
+                "limit.$": "$.limit",
                 "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
               }
             },
