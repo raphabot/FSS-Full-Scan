@@ -16,10 +16,6 @@ exports.lambda_handler = async (event) => {
     stateKey: KEY_WITH_KEYS_TO_SCAN,
     limit: 500
   }
-  // return {
-  //   keys: allKeys,
-  //   bucket: bucket
-  // };
 };
 
 const getKeysInPage = async (bucket, continuationToken) => {

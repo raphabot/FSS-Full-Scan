@@ -6,7 +6,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as stepfunctions from 'aws-cdk-lib/aws-stepfunctions';
-import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
+import * as fs from 'fs';
 
 export class FssFullScanStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
@@ -63,7 +63,7 @@ export class FssFullScanStack extends Stack {
     }));
 
     const paginatorFunction = new lambda.Function(this, 'PaginatorFunction', {
-      runtime: lambda.Runtime.NODEJS_14_X,
+      runtime: lambda.Runtime.NODEJS_16_X,
       architecture: lambda.Architecture.ARM_64,
       handler: 'index.lambda_handler',
       role: paginatorExecutionRole,
@@ -72,7 +72,7 @@ export class FssFullScanStack extends Stack {
       environment: {
         'STATE_BUCKET': stateBucket.bucketName,
       },
-      code: lambda.Code.fromAsset('./lambda/paginator')
+      code: lambda.Code.fromInline(fs.readFileSync('./lambda/paginator/index.js').toString())
     });
     stateBucket.grantWrite(paginatorFunction);
 
@@ -83,7 +83,7 @@ export class FssFullScanStack extends Stack {
     });
 
     const filterFunction = new lambda.Function(this, 'FilterFunction', {
-      runtime: lambda.Runtime.NODEJS_14_X,
+      runtime: lambda.Runtime.NODEJS_16_X,
       architecture: lambda.Architecture.ARM_64,
       handler: 'index.lambda_handler',
       role: filterExecutionRole,
@@ -92,7 +92,7 @@ export class FssFullScanStack extends Stack {
       environment: {
         'BUCKET_NAME': bucket.bucketName,
       },
-      code: lambda.Code.fromAsset('./lambda/filter')
+      code: lambda.Code.fromInline(fs.readFileSync('./lambda/filter/index.js').toString())
     });
     stateBucket.grantReadWrite(filterFunction);
 
@@ -124,7 +124,7 @@ export class FssFullScanStack extends Stack {
         'SNSArn': topicArn,
         'SQSUrl': sqsUrl,
       },
-      code: lambda.Code.fromAsset('./lambda/scanner')
+      code: lambda.Code.fromInline(fs.readFileSync('./lambda/scanner/index.py').toString())
     });
 
     // ScannerLoop Step Function
@@ -282,10 +282,15 @@ export class FssFullScanStack extends Stack {
     }));
 
     const fullScanStarterStateMachineName = 'fullScanStarterStateMachine';
-    const fullScanStarterLoopStepFunction = new stepfunctions.CfnStateMachine(this, "FullScanStarterLoopStepFunction", {
-      roleArn: fullScanStarterExecutionRole.roleArn,
+    const fullScanStarterLoopStepFunction = new stepfunctions.StateMachine(this, "FullScanStarterLoopStepFunction", {
+      role: fullScanStarterExecutionRole,
       stateMachineName: fullScanStarterStateMachineName,
-      definitionString: `
+      definition: new stepfunctions.Pass(this, 'StartState'),
+    });
+
+    // Handling the incapability of stepfunctions.StateMachine having a string as its definition.
+    const cfnFullScanStarterLoopStepFunction = fullScanStarterLoopStepFunction.node.defaultChild as stepfunctions.CfnStateMachine;
+    cfnFullScanStarterLoopStepFunction.definitionString =  `
       {
         "Comment": "Kicks of a Full Scan using File Storage Security.",
         "StartAt": "List all keys in bucket",
@@ -332,16 +337,15 @@ export class FssFullScanStack extends Stack {
         }
       }
       `
+   
+    const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
+      schedule: events.Schedule.expression(schedule.valueAsString),
+      targets: [new targets.SfnStateMachine(fullScanStarterLoopStepFunction, {})],
     });
-
-    // const scanOnSchedule = new events.Rule(this, 'ScanOnSchedule', {
-    //   schedule: events.Schedule.expression(schedule.valueAsString),
-    //   targets: [new targets.LambdaFunction(paginatorFunction)],
-    // });
-    // const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
-    // cfnScanOnSchedule.cfnOptions.condition = setSchedule;
-    // const cfnFullScanner = paginatorFunction.permissionsNode.defaultChild as lambda.CfnPermission;
-    // cfnFullScanner.cfnOptions.condition = setSchedule;
+    const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
+    cfnScanOnSchedule.cfnOptions.condition = setSchedule;
+    const cfnFullScanner = paginatorFunction.permissionsNode.defaultChild as lambda.CfnPermission;
+    cfnFullScanner.cfnOptions.condition = setSchedule;
 
     new CfnOutput(this, 'FullScanFunctionPage', {
       value: `https://${this.region}.console.aws.amazon.com/states/home?region=${this.region}#/statemachines/view/arn:${this.partition}:states:${Stack.of(this).region}:${Stack.of(this).account}:stateMachine:${fullScanStarterStateMachineName}`,
