@@ -28,7 +28,7 @@
     "watch": "tsc -w",
     "test": "jest",
     "cdk": "cdk",
-    "synth": "npm run build && cdk synth --no-version-reporting --version-reporting false --path-metadata false --asset-metadata false > template.yaml"
+    "cloudformation": "npm run build && cdk synth --no-version-reporting --version-reporting false --path-metadata false --asset-metadata false > template.yaml"
   },
   "devDependencies": {
     "@aws-cdk/assert": "2.38.1",
