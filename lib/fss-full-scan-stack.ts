@@ -344,8 +344,6 @@ export class FssFullScanStack extends Stack {
     });
     const cfnScanOnSchedule = scanOnSchedule.node.defaultChild as events.CfnRule;
     cfnScanOnSchedule.cfnOptions.condition = setSchedule;
-    const cfnFullScanner = paginatorFunction.permissionsNode.defaultChild as lambda.CfnPermission;
-    cfnFullScanner.cfnOptions.condition = setSchedule;
 
     new CfnOutput(this, 'FullScanFunctionPage', {
       value: `https://${this.region}.console.aws.amazon.com/states/home?region=${this.region}#/statemachines/view/arn:${this.partition}:states:${Stack.of(this).region}:${Stack.of(this).account}:stateMachine:${fullScanStarterStateMachineName}`,
